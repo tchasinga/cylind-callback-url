@@ -13,8 +13,6 @@ async function initPostgresConnection(): Promise<void> {
       connectionString,
       // Additional pool configuration
       max: 20, // maximum number of clients in the pool
-      idleTimeoutMillis: 30000, // how long a client is allowed to remain idle before being closed
-      connectionTimeoutMillis: 2000, // how long to try connecting before timing out
     });
 
     // Test the connection
