@@ -77,7 +77,32 @@ export async function POST(request: Request) {
       }
     }
 
-    // Update database with payment status using parameterized query
+    // First find the most recent pending payment for this phone/amount
+    const findQuery = `
+      SELECT id 
+      FROM achievepayemetwithmpesa 
+      WHERE 
+        mpesa_number = $1
+        AND totalcost = $2
+        AND (payment_status IS NULL OR payment_status = 'pending')
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    
+    const formattedPhone = phoneNumber ? `254${phoneNumber.slice(-9)}` : null;
+    const findResult = await client.query(findQuery, [formattedPhone, amount]);
+    
+    if (findResult.rows.length === 0) {
+      console.error('No matching pending payment found for:', { formattedPhone, amount });
+      return NextResponse.json({
+        ResultCode: 1,
+        ResultDesc: "No matching pending payment found"
+      });
+    }
+
+    const paymentId = findResult.rows[0].id;
+
+    // Update the specific payment record
     await client.query(
       `UPDATE achievepayemetwithmpesa 
        SET 
@@ -88,12 +113,7 @@ export async function POST(request: Request) {
          result_description = $5,
          merchant_request_id = $6,
          checkout_request_id = $7
-       WHERE 
-         mpesa_number = $8
-         AND totalcost = $9
-         AND (payment_status IS NULL OR payment_status = 'pending')
-       ORDER BY created_at DESC
-       LIMIT 1`,
+       WHERE id = $8`,
       [
         isSuccess ? 'completed' : 'failed',
         mpesaReceiptNumber || null,
@@ -102,15 +122,12 @@ export async function POST(request: Request) {
         ResultDesc,
         MerchantRequestID,
         CheckoutRequestID,
-        phoneNumber ? `254${phoneNumber.slice(-9)}` : null,
-        amount
+        paymentId
       ]
     );
 
-    // Log the update result
-    console.log(`Payment status updated for phone: ${phoneNumber}, amount: ${amount}, status: ${isSuccess ? 'success' : 'failed'}`);
+    console.log(`Payment ${paymentId} updated for phone: ${formattedPhone}, amount: ${amount}, status: ${isSuccess ? 'success' : 'failed'}`);
 
-    // Return success response to M-Pesa
     return NextResponse.json({
       ResultCode: 0,
       ResultDesc: "Callback processed successfully"
