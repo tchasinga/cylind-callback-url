@@ -1,7 +1,6 @@
 import { getPostgresPoolConnection } from "@/lib/mysqlconnection";
 import { NextResponse } from "next/server";
 
-// Define M-Pesa callback response types
 interface MpesaCallbackBody {
   Body: {
     stkCallback: {
@@ -24,7 +23,6 @@ export async function POST(request: Request) {
   try {
     const callbackData: MpesaCallbackBody = await request.json();
 
-    // Validate callback data structure
     if (!callbackData?.Body?.stkCallback) {
       console.error('Invalid callback structure:', callbackData);
       return NextResponse.json(
@@ -41,7 +39,6 @@ export async function POST(request: Request) {
       CallbackMetadata
     } = callbackData.Body.stkCallback;
 
-    // Log the callback for debugging
     console.log('M-Pesa Callback Received:', {
       MerchantRequestID,
       CheckoutRequestID,
@@ -50,83 +47,128 @@ export async function POST(request: Request) {
       CallbackMetadata
     });
 
-    // Check if payment was successful (ResultCode 0 means success)
     const isSuccess = ResultCode === 0;
     let mpesaReceiptNumber = '';
     let phoneNumber = '';
     let amount = 0;
     let transactionDate = '';
 
-    // Extract payment details if successful
     if (isSuccess && CallbackMetadata) {
       for (const item of CallbackMetadata.Item) {
         switch (item.Name) {
-          case 'MpesaReceiptNumber':
-            mpesaReceiptNumber = String(item.Value);
-            break;
-          case 'PhoneNumber':
-            phoneNumber = String(item.Value);
-            break;
-          case 'Amount':
-            amount = Number(item.Value);
-            break;
-          case 'TransactionDate':
-            transactionDate = String(item.Value);
-            break;
+          case 'MpesaReceiptNumber': mpesaReceiptNumber = String(item.Value); break;
+          case 'PhoneNumber': phoneNumber = String(item.Value); break;
+          case 'Amount': amount = Number(item.Value); break;
+          case 'TransactionDate': transactionDate = String(item.Value); break;
         }
       }
     }
 
-    // First find the most recent pending payment for this phone/amount
-    const findQuery = `
-      SELECT id 
-      FROM achievepayemetwithmpesa 
-      WHERE 
-        mpesa_number = $1
-        AND totalcost = $2
-        AND (payment_status IS NULL OR payment_status = 'pending')
-      ORDER BY created_at DESC
-      LIMIT 1
-    `;
-    
+    // Improved payment matching logic
     const formattedPhone = phoneNumber ? `254${phoneNumber.slice(-9)}` : null;
-    const findResult = await client.query(findQuery, [formattedPhone, amount]);
     
-    if (findResult.rows.length === 0) {
-      console.error('No matching pending payment found for:', { formattedPhone, amount });
-      return NextResponse.json({
-        ResultCode: 1,
-        ResultDesc: "No matching pending payment found"
-      });
+    // Try matching by CheckoutRequestID first (most reliable)
+    let paymentId: number | null = null;
+    let matchMethod = '';
+
+    // 1. Try to match by CheckoutRequestID if we have it
+    if (CheckoutRequestID) {
+      const result = await client.query(
+        `SELECT id FROM achievepayemetwithmpesa 
+         WHERE checkout_request_id = $1 LIMIT 1`,
+        [CheckoutRequestID]
+      );
+      if (result.rows.length > 0) {
+        paymentId = result.rows[0].id;
+        matchMethod = 'CheckoutRequestID';
+      }
     }
 
-    const paymentId = findResult.rows[0].id;
+    // 2. If not found, try matching by phone and amount (within last 30 minutes)
+    if (!paymentId && formattedPhone && amount) {
+      const result = await client.query(
+        `SELECT id FROM achievepayemetwithmpesa 
+         WHERE mpesa_number = $1 
+         AND totalcost = $2
+         AND (payment_status IS NULL OR payment_status = 'pending')
+         AND created_at >= NOW() - INTERVAL '30 minutes'
+         ORDER BY created_at DESC LIMIT 1`,
+        [formattedPhone, amount]
+      );
+      if (result.rows.length > 0) {
+        paymentId = result.rows[0].id;
+        matchMethod = 'PhoneAndAmount';
+      }
+    }
 
-    // Update the specific payment record
-    await client.query(
-      `UPDATE achievepayemetwithmpesa 
-       SET 
-         payment_status = $1,
-         mpesa_receipt_number = $2,
-         transaction_date = $3,
-         result_code = $4,
-         result_description = $5,
-         merchant_request_id = $6,
-         checkout_request_id = $7
-       WHERE id = $8`,
-      [
-        isSuccess ? 'completed' : 'failed',
-        mpesaReceiptNumber || null,
-        transactionDate || null,
-        ResultCode,
-        ResultDesc,
-        MerchantRequestID,
+    if (!paymentId) {
+      console.error('No matching payment found for:', {
         CheckoutRequestID,
-        paymentId
-      ]
-    );
+        formattedPhone,
+        amount,
+        transactionDate
+      });
+      
+      // Create a new record if we have complete payment info but no match
+      if (isSuccess && formattedPhone && amount && mpesaReceiptNumber) {
+        const insertResult = await client.query(
+          `INSERT INTO achievepayemetwithmpesa 
+           (resellername, totalcost, mpesa_number, payment_status,
+            mpesa_receipt_number, transaction_date, result_code,
+            result_description, merchant_request_id, checkout_request_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING id`,
+          [
+            'Auto-created from callback', // Default reseller name
+            amount,
+            formattedPhone,
+            'completed',
+            mpesaReceiptNumber,
+            transactionDate,
+            ResultCode,
+            ResultDesc,
+            MerchantRequestID,
+            CheckoutRequestID
+          ]
+        );
+        paymentId = insertResult.rows[0].id;
+        matchMethod = 'NewRecordCreated';
+        console.log(`Created new payment record ${paymentId} from callback`);
+      } else {
+        return NextResponse.json({
+          ResultCode: 1,
+          ResultDesc: "No matching payment found and insufficient data to create new record"
+        });
+      }
+    }
 
-    console.log(`Payment ${paymentId} updated for phone: ${formattedPhone}, amount: ${amount}, status: ${isSuccess ? 'success' : 'failed'}`);
+    // Update payment record if we found or created one
+    if (paymentId) {
+      await client.query(
+        `UPDATE achievepayemetwithmpesa 
+         SET 
+           payment_status = $1,
+           mpesa_receipt_number = COALESCE($2, mpesa_receipt_number),
+           transaction_date = COALESCE($3, transaction_date),
+           result_code = $4,
+           result_description = $5,
+           merchant_request_id = COALESCE($6, merchant_request_id),
+           checkout_request_id = COALESCE($7, checkout_request_id)
+         WHERE id = $8`,
+        [
+          isSuccess ? 'completed' : 'failed',
+          mpesaReceiptNumber,
+          transactionDate,
+          ResultCode,
+          ResultDesc,
+          MerchantRequestID,
+          CheckoutRequestID,
+          paymentId
+        ]
+      );
+
+      console.log(`Payment ${paymentId} updated (matched by ${matchMethod})`);
+    }
 
     return NextResponse.json({
       ResultCode: 0,
@@ -145,11 +187,4 @@ export async function POST(request: Request) {
   } finally {
     client.release();
   }
-}
-
-export async function GET() {
-  return NextResponse.json(
-    { message: "M-Pesa callback URL is ready to receive POST requests" },
-    { status: 200 }
-  );
 }
