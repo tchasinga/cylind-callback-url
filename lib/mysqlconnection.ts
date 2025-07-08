@@ -4,8 +4,7 @@ let pgPoolConnection: Pool;
 
 async function initPostgresConnection(): Promise<void> {
   try {
-    const connectionString = process.env.DB_URL || 'postgresql://cylindetrack_owner:npg_NiWwvF4cyX0m@ep-patient-leaf-a84re0qa-pooler.eastus2.azure.neon.tech/cylindetrack?sslmode=require&channel_binding=require';
-    
+    const connectionString = 'postgresql://neondb_owner:npg_9jIAqS5kVCBU@ep-red-recipe-a80d717q-pooler.eastus2.azure.neon.tech/neondb?sslmode=require&channel_binding=require';
     pgPoolConnection = new Pool({
       connectionString,
       ssl: {
