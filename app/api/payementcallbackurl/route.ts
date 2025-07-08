@@ -1,207 +1,80 @@
-import { getPostgresPoolConnection } from '@/lib/mysqlconnection'
-import { NextResponse } from 'next/server'
+import { getPostgresPoolConnection } from '@/lib/mysqlconnection';
+import { NextResponse } from 'next/server';
 
-interface MpesaCallbackBody {
-  Body: {
-    stkCallback: {
-      MerchantRequestID: string
-      CheckoutRequestID: string
-      ResultCode: number
-      ResultDesc: string
-      CallbackMetadata?: {
-        Item: Array<{
-          Name: string
-          Value: string | number
-        }>
-      }
-    }
-  }
-}
-
-export async function POST (request: Request) {
-  const client = await getPostgresPoolConnection().connect()
+export async function POST(request: Request) {
   try {
-    const callbackData: MpesaCallbackBody = await request.json()
-
-    if (!callbackData?.Body?.stkCallback) {
-      console.error('Invalid callback structure:', callbackData)
-      return NextResponse.json(
-        { error: 'Invalid callback structure' },
-        { status: 400 }
-      )
-    }
+    const body = await request.json();
 
     const {
-      MerchantRequestID,
-      CheckoutRequestID,
-      ResultCode,
-      ResultDesc,
-      CallbackMetadata
-    } = callbackData.Body.stkCallback
+      Body: {
+        stkCallback: {
+          MerchantRequestID,
+          CheckoutRequestID,
+          ResultCode,
+          ResultDesc,
+          CallbackMetadata
+        }
+      }
+    } = body;
 
-    console.log('M-Pesa Callback Received:', {
-      MerchantRequestID,
-      CheckoutRequestID,
-      ResultCode,
-      ResultDesc,
-      CallbackMetadata
-    })
+    // Extract relevant fields from metadata
+    let MpesaReceiptNumber = null;
+    let TransactionDate = null;
 
-    const isSuccess = ResultCode === 0
-    let mpesaReceiptNumber = ''
-    let phoneNumber = ''
-    let amount = 0
-    let transactionDate = ''
-
-    if (isSuccess && CallbackMetadata) {
+    if (CallbackMetadata && CallbackMetadata.Item) {
       for (const item of CallbackMetadata.Item) {
-        switch (item.Name) {
-          case 'MpesaReceiptNumber':
-            mpesaReceiptNumber = String(item.Value)
-            break
-          case 'PhoneNumber':
-            phoneNumber = String(item.Value)
-            break
-          case 'Amount':
-            amount = Number(item.Value)
-            break
-          case 'TransactionDate':
-            transactionDate = String(item.Value)
-            break
+        if (item.Name === 'MpesaReceiptNumber') {
+          MpesaReceiptNumber = item.Value;
+        }
+        if (item.Name === 'TransactionDate') {
+          TransactionDate = item.Value;
         }
       }
     }
 
-    // Improved payment matching logic
-    const formattedPhone = phoneNumber ? `254${phoneNumber.slice(-9)}` : null
+    const client = await getPostgresPoolConnection().connect();
 
-    // Try matching by CheckoutRequestID first (most reliable)
-    let paymentId: number | null = null
-    let matchMethod = ''
-
-    // 1. Try to match by CheckoutRequestID if we have it
-    if (CheckoutRequestID) {
-      const result = await client.query(
-        `SELECT id FROM achievepayemetwithmpesa 
-         WHERE checkout_request_id = $1 LIMIT 1`,
-        [CheckoutRequestID]
-      )
-      if (result.rows.length > 0) {
-        paymentId = result.rows[0].id
-        matchMethod = 'CheckoutRequestID'
-      }
-    }
-
-    // 2. If not found, try matching by phone and amount (within last 30 minutes)
-    if (!paymentId && formattedPhone && amount) {
-      const result = await client.query(
-        `SELECT id FROM achievepayemetwithmpesa 
-         WHERE mpesa_number = $1 
-         AND totalcost = $2
-         AND (payment_status IS NULL OR payment_status = 'pending')
-         AND created_at >= NOW() - INTERVAL '30 minutes'
-         ORDER BY created_at DESC LIMIT 1`,
-        [formattedPhone, amount]
-      )
-      if (result.rows.length > 0) {
-        paymentId = result.rows[0].id
-        matchMethod = 'PhoneAndAmount'
-      }
-    }
-
-    if (!paymentId) {
-      console.error('No matching payment found for:', {
-        CheckoutRequestID,
-        formattedPhone,
-        amount,
-        transactionDate
-      })
-
-      // Create a new record if we have complete payment info but no match
-      if (isSuccess && formattedPhone && amount && mpesaReceiptNumber) {
-        const insertResult = await client.query(
-          `INSERT INTO achievepayemetwithmpesa 
-           (resellername, totalcost, mpesa_number, payment_status,
-            mpesa_receipt_number, transaction_date, result_code,
-            result_description, merchant_request_id, checkout_request_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-           RETURNING id`,
-          [
-            'Auto-created from callback', // Default reseller name
-            amount,
-            formattedPhone,
-            'completed',
-            mpesaReceiptNumber,
-            transactionDate,
-            ResultCode,
-            ResultDesc,
-            MerchantRequestID,
-            CheckoutRequestID
-          ]
-        )
-        paymentId = insertResult.rows[0].id
-        matchMethod = 'NewRecordCreated'
-        console.log(`Created new payment record ${paymentId} from callback`)
-      } else {
-        return NextResponse.json({
-          ResultCode: 1,
-          ResultDesc:
-            'No matching payment found and insufficient data to create new record'
-        })
-      }
-    }
-
-    // Update payment record if we found or created one
-    if (paymentId) {
+    try {
+      // Update the most recent pending transaction with this checkout ID
       await client.query(
-        `UPDATE achievepayemetwithmpesa 
-         SET 
-           payment_status = $1,
-           mpesa_receipt_number = COALESCE($2, mpesa_receipt_number),
-           transaction_date = COALESCE($3, transaction_date),
-           result_code = $4,
-           result_description = $5,
-           merchant_request_id = COALESCE($6, merchant_request_id),
-           checkout_request_id = COALESCE($7, checkout_request_id)
-         WHERE id = $8`,
+        `
+          UPDATE achievepayemetwithmpesa
+          SET
+            payment_status = $1,
+            mpesa_receipt_number = $2,
+            transaction_date = $3,
+            result_code = $4,
+            result_description = $5,
+            merchant_request_id = $6,
+            checkout_request_id = $7
+          WHERE checkout_request_id IS NULL
+            AND merchant_request_id IS NULL
+            AND payment_status = 'pending'
+            AND mpesa_number IS NOT NULL
+          ORDER BY created_at DESC
+          LIMIT 1;
+        `,
         [
-          isSuccess ? 'completed' : 'failed',
-          mpesaReceiptNumber,
-          transactionDate,
+          ResultCode === 0 ? 'completed' : 'failed',
+          MpesaReceiptNumber,
+          TransactionDate,
           ResultCode,
           ResultDesc,
           MerchantRequestID,
-          CheckoutRequestID,
-          paymentId
+          CheckoutRequestID
         ]
-      )
-
-      console.log(`Payment ${paymentId} updated (matched by ${matchMethod})`)
+      );
+    } finally {
+      client.release();
     }
 
-    return NextResponse.json({
-      ResultCode: 0,
-      ResultDesc: 'Callback processed successfully'
-    })
+    return NextResponse.json({ success: true, message: 'Callback processed' });
   } catch (error) {
-    console.error('Callback processing error:', error)
+    console.error('Callback processing error:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
     return NextResponse.json(
-      {
-        ResultCode: 1,
-        ResultDesc: 'Error processing callback'
-      },
+      { error: 'Callback processing failed', details: errorMessage },
       { status: 500 }
-    )
-  } finally {
-    client.release()
+    );
   }
-}
-
-// get request
-
-export async function GET () {
-  return NextResponse.json(
-    { message: 'This endpoint only accepts POST requests.' },
-    { status: 405 }
-  )
 }
